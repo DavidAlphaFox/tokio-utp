@@ -672,6 +672,7 @@ impl UtpSocket {
 
     /// Inserts a new sample in the current delay list after removing samples older than one RTT, as
     /// specified in RFC6817.
+    /// 对延迟进行计算，根据RFC6817实现的
     fn update_current_delay(&mut self, v: Delay, now: Timestamp) {
         // Remove samples more than one RTT old
         let rtt = (self.rtt as i64 * 100).into();
