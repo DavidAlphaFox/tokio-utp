@@ -611,18 +611,21 @@ impl UtpSocket {
     fn send_packet(&mut self, packet: &mut Packet) -> Result<()> {
         debug!("current window: {}", self.send_window.len());
         let max_inflight = min(self.cwnd, self.remote_wnd_size);
+        //计算最大可以发送的字节数，在拥塞窗口和对端窗口中选最小值
         let max_inflight = max(MIN_CWND * MSS, max_inflight);
+        // 确保最大可以发送字节是少是2个包
         let now = now_microseconds();
 
         // Wait until enough in-flight packets are acknowledged for rate control purposes, but don't
         // wait more than 500 ms (PRE_SEND_TIMEOUT) before sending the packet.
         while self.curr_window >= max_inflight && now_microseconds() - now < PRE_SEND_TIMEOUT.into() {
+            //当我们没有足够多的传输字节，且目前还没有超过500ms的强制重传时间
             debug!("self.curr_window: {}", self.curr_window);
             debug!("max_inflight: {}", max_inflight);
             debug!("self.duplicate_ack_count: {}", self.duplicate_ack_count);
             debug!("now_microseconds() - now = {}", now_microseconds() - now);
             let mut buf = [0; BUF_SIZE];
-            try!(self.recv(&mut buf));
+            self.recv(&mut buf)?;
         }
         debug!("out: now_microseconds() - now = {}", now_microseconds() - now);
 
@@ -635,11 +638,11 @@ impl UtpSocket {
         if distance_a > distance_b {
             debug!("Packet already acknowledged, skipping...");
             return Ok(());
-        }
+        } //确保不要发送已经被对端确认过的包
 
-        packet.set_timestamp(now_microseconds());
-        packet.set_timestamp_difference(self.their_delay);
-        try!(self.socket.send_to(packet.as_ref(), self.connected_to));
+        packet.set_timestamp(now_microseconds()); //设置包的时间戳
+        packet.set_timestamp_difference(self.their_delay); //设置对端时间差值
+        self.socket.send_to(packet.as_ref(), self.connected_to)?;
         debug!("sent {:?}", packet);
 
         Ok(())
@@ -982,7 +985,7 @@ impl UtpSocket {
 
     fn handle_state_packet(&mut self, packet: &Packet) {
         if packet.ack_nr() == self.last_acked {
-            self.duplicate_ack_count += 1;
+            self.duplicate_ack_count += 1; //增加duplicate_ack_count
         } else {
             self.last_acked = packet.ack_nr();
             self.last_acked_timestamp = now_microseconds();
@@ -1014,7 +1017,7 @@ impl UtpSocket {
             let rtt = u32::from(our_delay - self.queuing_delay()) / 1000; // in milliseconds
             self.update_congestion_timeout(rtt as i32);
         }
-
+        //确定包已经丢失了，duplicate_ack_count是3，并且发送队列不为空
         let mut packet_loss_detected: bool = !self.send_window.is_empty() &&
                                              self.duplicate_ack_count == 3;
 
@@ -1023,11 +1026,13 @@ impl UtpSocket {
             if extension.get_type() == ExtensionType::SelectiveAck {
                 // If three or more packets are acknowledged past the implicit missing one,
                 // assume it was lost.
+                // 如果SACK中的数量大于3了，说明当前包丢失了
                 if extension.iter().count_ones() >= 3 {
+                    //立刻重传下一个包
                     self.resend_lost_packet(packet.ack_nr() + 1);
                     packet_loss_detected = true;
                 }
-
+                //遍历SACK，直接重传所有没有置位的的包
                 if let Some(last_seq_nr) = self.send_window.last().map(Packet::seq_nr) {
                     let lost_packets = extension.iter()
                         .enumerate()
@@ -1051,12 +1056,14 @@ impl UtpSocket {
         // already resent.
         if !self.send_window.is_empty() && self.duplicate_ack_count == 3 &&
            !packet.extensions().any(|ext| ext.get_type() == ExtensionType::SelectiveAck) {
+            //丢包且没有SACK的情况下，立刻重传下一个包
             self.resend_lost_packet(packet.ack_nr() + 1);
         }
 
         // Packet lost, halve the congestion window
         if packet_loss_detected {
             debug!("packet loss detected, halving congestion window");
+            //出现丢包，立刻调正拥塞窗口，但是拥塞窗口，最小为2个包
             self.cwnd = max(self.cwnd / 2, MIN_CWND * MSS);
             debug!("cwnd: {}", self.cwnd);
         }
