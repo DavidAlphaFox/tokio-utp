@@ -168,12 +168,12 @@ impl UtpSocket {
     /// The connection identifier of the resulting socket is randomly generated.
     fn from_raw_parts(s: UdpSocket, src: SocketAddr) -> UtpSocket {
         let (receiver_id, sender_id) = generate_sequential_identifiers();
-
+        //从已有Socket和一个地址初始化一个utp的socket
         UtpSocket {
             socket: s,
             connected_to: src,
-            receiver_connection_id: receiver_id,
-            sender_connection_id: sender_id,
+            receiver_connection_id: receiver_id, //随机的connection id
+            sender_connection_id: sender_id, //随机的sender_id
             seq_nr: 1,
             ack_nr: 0,
             state: SocketState::New,
@@ -193,7 +193,7 @@ impl UtpSocket {
             base_delays: VecDeque::with_capacity(BASE_HISTORY),
             their_delay: Delay::default(),
             last_rollover: Timestamp::default(),
-            congestion_timeout: INITIAL_CONGESTION_TIMEOUT,
+            congestion_timeout: INITIAL_CONGESTION_TIMEOUT, //初始值是1000
             cwnd: INIT_CWND * MSS,
             max_retransmission_retries: MAX_RETRANSMISSION_RETRIES,
         }
@@ -230,12 +230,12 @@ impl UtpSocket {
     ///
     /// If more than one valid address is specified, only the first will be used.
     pub fn connect<A: ToSocketAddrs>(other: A) -> Result<UtpSocket> {
-        let addr = try!(take_address(other));
+        let addr = take_address(other)?;
         let my_addr = match addr {
             SocketAddr::V4(_) => "0.0.0.0:0",
             SocketAddr::V6(_) => "[::]:0",
         };
-        let mut socket = try!(UtpSocket::bind(my_addr));
+        let mut socket = UtpSocket::bind(my_addr)?;
         socket.connected_to = addr;
 
         let mut packet = Packet::new();
@@ -252,7 +252,7 @@ impl UtpSocket {
 
             // Send packet
             debug!("Connecting to {}", socket.connected_to);
-            try!(socket.socket.send_to(packet.as_ref(), socket.connected_to));
+            socket.socket.send_to(packet.as_ref(), socket.connected_to)?;
             socket.state = SocketState::SynSent;
             debug!("sent {:?}", packet);
 
@@ -343,7 +343,7 @@ impl UtpSocket {
                 // A closed socket with no pending data can only "read" 0 new bytes.
                 if self.state == SocketState::Closed {
                     return Ok((0, self.connected_to));
-                }
+                } //如果我们的状态是closed，并且也没数据可读取了，直接放回
 
                 match self.recv(buf) {
                     Ok((0, _src)) => continue,
@@ -364,22 +364,24 @@ impl UtpSocket {
         loop {
             // Abort loop if the current try exceeds the maximum number of retransmission retries.
             if retries >= self.max_retransmission_retries {
+                //达到了最大重试次数
                 self.state = SocketState::Closed;
                 return Err(SocketError::ConnectionTimedOut.into());
             }
-
+            // 处理连接超时的情况,当不是处在新端口的状态下
             let timeout = if self.state != SocketState::New {
                 debug!("setting read timeout of {} ms", self.congestion_timeout);
                 Some(Duration::from_millis(self.congestion_timeout))
             } else { None };
-
+            // 设置等待时长
             self.socket.set_read_timeout(timeout).expect("Error setting read timeout");
             match self.socket.recv_from(&mut b) {
                 Ok((r, s)) => { read = r; src = s; break },
                 Err(ref e) if (e.kind() == ErrorKind::WouldBlock ||
                                e.kind() == ErrorKind::TimedOut) => {
                     debug!("recv_from timed out");
-                    try!(self.handle_receive_timeout());
+                    //处理接收超时
+                    self.handle_receive_timeout()?
                 }
                 Err(e) => return Err(e),
             };
@@ -389,7 +391,7 @@ impl UtpSocket {
             debug!("{} ms elapsed", elapsed_ms);
             retries += 1;
         }
-
+        //尝试获取一个包
         // Decode received data into a packet
         let packet = match Packet::try_from(&b[..read]) {
             Ok(packet) => packet,
@@ -402,9 +404,9 @@ impl UtpSocket {
         debug!("received {:?}", packet);
 
         // Process packet, including sending a reply if necessary
-        if let Some(mut pkt) = try!(self.handle_packet(&packet, src)) {
+        if let Some(mut pkt) = self.handle_packet(&packet, src)? {
             pkt.set_wnd_size(WINDOW_SIZE);
-            try!(self.socket.send_to(pkt.as_ref(), src));
+            self.socket.send_to(pkt.as_ref(), src)?;
             debug!("sent {:?}", pkt);
         }
 
@@ -422,24 +424,26 @@ impl UtpSocket {
     }
 
     fn handle_receive_timeout(&mut self) -> Result<()> {
-        self.congestion_timeout *= 2;
-        self.cwnd = MSS;
+        self.congestion_timeout *= 2; //对拥塞时间进行翻倍
+        self.cwnd = MSS; //拥塞窗口大小
 
         // There are three possible cases here:
         //
         // - If the socket is sending and waiting for acknowledgements (the send window is
         //   not empty), resend the first unacknowledged packet;
-        //
+        //   socket发送数据并等待ACK，那么发送窗口就不为空，需要重发第一个没有ACK的包
         // - If the socket is not sending and it hasn't sent a FIN yet, then it's waiting
         //   for incoming packets: send a fast resend request;
-        //
+        //    socket没有发送数据，并且没有发送Fin，那么等待数据，并处理请求
         // - If the socket sent a FIN previously, resend it.
+        //    发送Fin数据后，直接重发Fin包
         debug!("self.send_window: {:?}",
                self.send_window.iter().map(Packet::seq_nr).collect::<Vec<u16>>());
 
         if self.send_window.is_empty() {
             // The socket is trying to close, all sent packets were acknowledged, and it has
             // already sent a FIN: resend it.
+            // 发送窗口为空，检查是否发送FIN
             if self.state == SocketState::FinSent {
                 let mut packet = Packet::new();
                 packet.set_connection_id(self.sender_connection_id);
@@ -448,13 +452,14 @@ impl UtpSocket {
                 packet.set_timestamp(now_microseconds());
                 packet.set_type(PacketType::Fin);
 
-                // Send FIN
-                try!(self.socket.send_to(packet.as_ref(), self.connected_to));
+                // Send FIN 发送FIN请求
+                self.socket.send_to(packet.as_ref(), self.connected_to)?;
                 debug!("resent FIN: {:?}", packet);
             } else if self.state != SocketState::New {
                 // The socket is waiting for incoming packets but the remote peer is silent:
                 // send a fast resend request.
                 debug!("sending fast resend request");
+                //如果是连接进行中，进行快速重传。
                 self.send_fast_resend_request();
             }
         } else {
@@ -462,7 +467,7 @@ impl UtpSocket {
             // peer: resend the first unacknowledged packet with the current timestamp.
             let mut packet = &mut self.send_window[0];
             packet.set_timestamp(now_microseconds());
-            try!(self.socket.send_to(packet.as_ref(), self.connected_to));
+            self.socket.send_to(packet.as_ref(), self.connected_to)?;
             debug!("resent {:?}", packet);
         }
 
@@ -717,15 +722,19 @@ impl UtpSocket {
             .filter(|pkt| pkt.seq_nr() > self.ack_nr + 1)
             .map(|pkt| (pkt.seq_nr() - self.ack_nr - 2) as usize)
             .map(|diff| (diff / 8, diff % 8));
-
+        //遍历incoming_buffer
+        //选出所有序列号大于ack_nr的包
+        //计算字节位置和bit位置
         let mut sack = Vec::new();
         for (byte, bit) in stashed {
             // Make sure the amount of elements in the SACK vector is a
             // multiple of 4 and enough to represent the lost packets
             while byte >= sack.len() || sack.len() % 4 != 0 {
+                //当byte大于sack长度的时候或者不是整4字节的时候
+                //用来保证永远是4字节对齐
                 sack.push(0u8);
             }
-
+            //对对应的字节进行置位操作
             sack[byte] |= 1 << bit;
         }
 
@@ -747,7 +756,7 @@ impl UtpSocket {
             packet.set_seq_nr(self.seq_nr);
             packet.set_ack_nr(self.ack_nr);
             let _ = self.socket.send_to(packet.as_ref(), self.connected_to);
-        }
+        } //快速的重发3次
     }
 
     fn resend_lost_packet(&mut self, lost_packet_nr: u16) {
@@ -798,6 +807,8 @@ impl UtpSocket {
         // Acknowledge only if the packet strictly follows the previous one
         if packet.seq_nr().wrapping_sub(self.ack_nr) == 1 {
             self.ack_nr = packet.seq_nr();
+            //自身的ack_nr值，就比报的seq_nr小1
+            //那就是非常确定的收到了下一个包
         }
 
         // Reset connection if connection id doesn't match and this isn't a SYN
@@ -805,27 +816,31 @@ impl UtpSocket {
            !(packet.connection_id() == self.sender_connection_id ||
              packet.connection_id() == self.receiver_connection_id) {
             return Ok(Some(self.prepare_reply(packet, PacketType::Reset)));
+            //如果不是SYN包，并且自己不是SYN_SENT状态
+            //并且包的connection_id并不等于自己的sender和receiver的id
+            //那么重置这个连接
         }
 
         // Update remote window size
-        self.remote_wnd_size = packet.wnd_size();
+        self.remote_wnd_size = packet.wnd_size(); //获取对面的窗口大小
         debug!("self.remote_wnd_size: {}", self.remote_wnd_size);
 
         // Update remote peer's delay between them sending the packet and us receiving it
         let now = now_microseconds();
-        self.their_delay = abs_diff(now, packet.timestamp());
+        self.their_delay = abs_diff(now, packet.timestamp()); //计算delay
         debug!("self.their_delay: {}", self.their_delay);
 
         match (self.state, packet.get_type()) {
             (SocketState::New, PacketType::Syn) => {
                 self.connected_to = src;
-                self.ack_nr = packet.seq_nr();
-                self.seq_nr = rand::random();
-                self.receiver_connection_id = packet.connection_id() + 1;
-                self.sender_connection_id = packet.connection_id();
-                self.state = SocketState::Connected;
-                self.last_dropped = self.ack_nr;
-
+                self.ack_nr = packet.seq_nr(); //将自己的ack_nr设置为对端包的seq_nr
+                self.seq_nr = rand::random(); //将自己的seq_nr设置成随机数，防止出现攻击
+                self.receiver_connection_id = packet.connection_id() + 1; //自己的receiver_id是对面connetion_id + 1
+                self.sender_connection_id = packet.connection_id(); //自己的sender_id是对面的connection_id
+                self.state = SocketState::Connected; //更新自身状态到connected
+                self.last_dropped = self.ack_nr; //incoming_buffer中的packet的seq_nr都将大于last_dropped
+                //自己是个全新的socket，并且包时SYN包
+                //发送ACK包(STATE)
                 Ok(Some(self.prepare_reply(packet, PacketType::State)))
             }
             (_, PacketType::Syn) => Ok(Some(self.prepare_reply(packet, PacketType::Reset))),
@@ -836,6 +851,7 @@ impl UtpSocket {
                 self.state = SocketState::Connected;
                 self.last_acked = packet.ack_nr();
                 self.last_acked_timestamp = now_microseconds();
+                //处理主动连接时的ACK包
                 Ok(None)
             }
             (SocketState::SynSent, _) => Err(SocketError::InvalidReply.into()),
@@ -847,14 +863,16 @@ impl UtpSocket {
             }
             (SocketState::Connected, PacketType::Fin) |
             (SocketState::FinSent, PacketType::Fin) => {
+                //处理收到FIN包的情况
                 if packet.ack_nr() < self.seq_nr {
                     debug!("FIN received but there are missing acknowledgements for sent packets");
                 }
+                //构建相应包
                 let mut reply = self.prepare_reply(packet, PacketType::State);
                 if packet.seq_nr().wrapping_sub(self.ack_nr) > 1 {
                     debug!("current ack_nr ({}) is behind received packet seq_nr ({})",
                            self.ack_nr, packet.seq_nr());
-
+                    //中间丢包了
                     // Set SACK extension payload if the packet is not in order
                     let sack = self.build_selective_ack();
 
@@ -862,7 +880,7 @@ impl UtpSocket {
                         reply.set_sack(sack);
                     }
                 }
-
+                //顺序的收完了所有的包，或者对端已经不关心我们是否丢包了
                 // Give up, the remote peer might not care about our missing packets
                 self.state = SocketState::Closed;
                 Ok(Some(reply))
@@ -896,16 +914,16 @@ impl UtpSocket {
             PacketType::Fin
         } else {
             PacketType::State
-        };
+        }; //根据自己的状态发送不同的包类型
         let mut reply = self.prepare_reply(packet, packet_type);
-
+        //创建一个全新的回复包
         if packet.seq_nr().wrapping_sub(self.ack_nr) > 1 {
             debug!("current ack_nr ({}) is behind received packet seq_nr ({})",
                    self.ack_nr, packet.seq_nr());
-
+            //收到了乱序包，不是自己希望的下一个包
             // Set SACK extension payload if the packet is not in order
             let sack = self.build_selective_ack();
-
+            //创建SACK序列
             if !sack.is_empty() {
                 reply.set_sack(sack);
             }
@@ -1130,22 +1148,22 @@ impl UtpListener {
         let mut buf = [0; BUF_SIZE];
 
         self.socket.recv_from(&mut buf).and_then(|(nread, src)| {
-            let packet = try!(Packet::try_from(&buf[..nread]));
-
+            let packet = Packet::try_from(&buf[..nread])?;
+            //得到一个packet
             // Ignore non-SYN packets
             if packet.get_type() != PacketType::Syn {
                 let message = format!("Expected SYN packet, got {:?} instead", packet.get_type());
                 return Err(SocketError::Other(message).into());
-            }
+            } //这个packet是SYN包
 
             // The address of the new socket will depend on the type of the listener.
             let inner_socket = self.socket.local_addr().and_then(|addr| match addr {
                 SocketAddr::V4(_) => UdpSocket::bind("0.0.0.0:0"),
                 SocketAddr::V6(_) => UdpSocket::bind("[::]:0"),
-            });
+            }); //得到本地的socket
 
-            let mut socket = try!(inner_socket.map(|s| UtpSocket::from_raw_parts(s, src)));
-
+            let mut socket = inner_socket.map(|s| UtpSocket::from_raw_parts(s, src))?;
+            // 让新的utp socket处理收到的包
             // Establish connection with remote peer
             if let Ok(Some(reply)) = socket.handle_packet(&packet, src) {
                 socket.socket.send_to(reply.as_ref(), src).and(Ok((socket, src)))

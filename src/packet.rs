@@ -204,7 +204,7 @@ impl Default for PacketHeader {
             type_ver: u8::from(PacketType::Data) << 4 | 1,
             extension: 0,
             connection_id: 0,
-            timestamp: 0,
+            timestamp: 0, //时的时间
             timestamp_difference: 0,
             wnd_size: 0,
             seq_nr: 0,
@@ -334,7 +334,14 @@ impl Packet {
         } else {
             // Skip over all extensions until last, then modify its "next extension type" field and
             // add the new extension after it.
-
+            // 当已经存在了Extension了，那么就立刻对Extension进行遍历
+            //Extension是链表性质的，第一个Extension在HEADER结束的位置
+            //0               8               16
+            // +---------------+---------------+
+            // | extension     | len           |
+            // +---------------+---------------+
+            // 第二个Extension会在第一个Extension的最开始字节中表示出来，此处的len是第一个Extension
+            // 所使用的包的长度
             // Consume known extensions and skip over unknown ones
             while index < self.0.len() && extension_type != ExtensionType::None {
                 let len = self.0[index + 1] as usize;
@@ -345,10 +352,11 @@ impl Packet {
 
                 // Arrived at last extension
                 if extension_type == ExtensionType::None {
+                    //下一个extension是空的
                     // Mark existence of an additional extension
                     self.0[index] = ExtensionType::SelectiveAck.into();
                 }
-                index += len + 2;
+                index += len + 2; //跳跃到下一个extension上
             }
         }
 
